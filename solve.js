@@ -12,8 +12,13 @@ const dirOf = (path) => {
 
 // ---------------------------------------------------------------- text
 
+const ESC_TEST_RE = /[&<>"']/;
+
 /** `s` with & < > " ' escaped (and returned as itself when it holds none). */
 function escapeHtml(s) {
+  // Most strings hold no escapable char: a native scan answers that far faster than the char loop below,
+  // which then runs only for the strings that do (the test is stateless: the regex is not global).
+  if (!ESC_TEST_RE.test(s)) return s;
   let out = null;
   let seg = 0;
   for (let i = 0; i < s.length; i++) {
@@ -34,6 +39,23 @@ function escapeHtml(s) {
 }
 
 const SLUG_MAX = 64;
+
+/**
+ * One character's share of the NFKD stream with its marks dropped, memoized per character. NFKD decomposes
+ * each character on its own; its only cross-character effect is reordering combining marks among themselves,
+ * and marks are dropped here anyway, so a whole string's stream is the concatenation of its characters'
+ * streams. Computing it per character avoids a whole-string normalize and regex pass per slug: titles and
+ * tags reuse a small alphabet, so nearly every lookup hits the memo.
+ */
+const slugExpansion = new Map();
+function slugExpansionOf(ch) {
+  let e = slugExpansion.get(ch);
+  if (e === undefined) {
+    e = ch.normalize('NFKD').replace(/\p{M}/gu, '');
+    slugExpansion.set(ch, e);
+  }
+  return e;
+}
 
 /** The slug of `text`, makefun-site's rule: NFKD, marks dropped, A-Z lowered, non-[a-z0-9] runs one "-". */
 function slugifyCompute(text) {
@@ -71,21 +93,25 @@ function slugifyCompute(text) {
       i = j;
     }
   } else {
-    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-    for (const ch of plain) {
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) {
-        if (out.length > 0) gap = true;
-        continue;
+    // The same keep/gap machine as the whole-string expansion would meet, fed character by character from
+    // the memoized per-character expansions: the stream it walks is identical (see slugExpansionOf).
+    outer: for (const ch of text) {
+      const e = slugExpansionOf(ch);
+      for (const c of e) {
+        let keep = null;
+        if (c >= 'A' && c <= 'Z') keep = c.toLowerCase();
+        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) keep = c;
+        if (keep === null) {
+          if (out.length > 0) gap = true;
+          continue;
+        }
+        if (gap) {
+          out += '-';
+          gap = false;
+        }
+        out += keep;
+        if (out.length > SLUG_MAX) break outer;
       }
-      if (gap) {
-        out += '-';
-        gap = false;
-      }
-      out += keep;
-      if (out.length > SLUG_MAX) break;
     }
   }
   if (out.length > SLUG_MAX) out = out.slice(0, SLUG_MAX);
@@ -564,7 +590,7 @@ function renderMarkdown(src, linkFn, slugifyC) {
   const lines = src.split('\n');
   const n = lines.length;
   const ids = new Set();
-  const blocks = [];
+  let out = '';
   const toc = [];
   let excerpt = null;
   let i = 0;
@@ -584,7 +610,7 @@ function renderMarkdown(src, linkFn, slugifyC) {
         i++;
         while (i < n && !fenceClose(lines[i])) inner += `${escapeHtml(lines[i++])}\n`;
         i++;
-        blocks.push(lang === '' ? `<pre><code>${inner}</code></pre>` : `<pre><code class="language-${escapeHtml(lang)}">${inner}</code></pre>`);
+        out += `${lang === '' ? `<pre><code>${inner}</code></pre>` : `<pre><code class="language-${escapeHtml(lang)}">${inner}</code></pre>`}\n`;
         continue;
       }
     } else if (c0 === 35) {
@@ -592,7 +618,7 @@ function renderMarkdown(src, linkFn, slugifyC) {
       if (h !== null) {
         const id = uniqueSlug(slugifyC(h.text), ids);
         const html = inline(h.text, linkFn);
-        blocks.push(`<h${h.depth} id="${id}">${html}</h${h.depth}>`);
+        out += `<h${h.depth} id="${id}">${html}</h${h.depth}>\n`;
         if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
         i++;
         continue;
@@ -604,11 +630,11 @@ function renderMarkdown(src, linkFn, slugifyC) {
         const t = trimSpacesTabs(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
         if (t !== '') kept.push(t);
       }
-      blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), linkFn)}</p>\n</blockquote>`);
+      out += `${kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), linkFn)}</p>\n</blockquote>`}\n`;
       continue;
     } else if (c0 === 45 || c0 === 42 || (c0 >= 48 && c0 <= 57)) {
       if ((c0 === 45 || c0 === 42) && isHR(line)) {
-        blocks.push('<hr>');
+        out += '<hr>\n';
         i++;
         continue;
       }
@@ -616,36 +642,37 @@ function renderMarkdown(src, linkFn, slugifyC) {
       const o0 = b0 === null ? orderedOf(line) : null;
       if (b0 !== null || o0 !== null) {
         const isOrdered = o0 !== null;
-        const items = [];
+        // Items are rendered as the next one starts rather than collected first: the same inline calls in
+        // the same order, without the items array and its per-continuation string rebuilds.
+        let inner = '';
+        let cur = null;
         while (i < n) {
           const l = lines[i];
           const m = isOrdered ? orderedOf(l) : bulletOf(l);
           if (m !== null) {
-            items.push(trimSpacesTabs(isOrdered ? m.text : m));
+            if (cur !== null) inner += `<li>${inline(cur, linkFn)}</li>\n`;
+            cur = trimSpacesTabs(isOrdered ? m.text : m);
             i++;
           } else if (isContinued(l)) {
-            items[items.length - 1] += `\n${trimSpacesTabs(l)}`;
+            cur += `\n${trimSpacesTabs(l)}`;
             i++;
           } else break;
         }
+        if (cur !== null) inner += `<li>${inline(cur, linkFn)}</li>\n`;
         const tag = isOrdered ? 'ol' : 'ul';
         const open = isOrdered && o0.num !== 1 ? `<ol start="${o0.num}">` : `<${tag}>`;
-        let inner = '';
-        for (const item of items) inner += `<li>${inline(item, linkFn)}</li>\n`;
-        blocks.push(`${open}\n${inner}</${tag}>`);
+        out += `${open}\n${inner}</${tag}>\n`;
         continue;
       }
     }
-    const body = [trimSpacesTabs(line)];
+    let text = trimSpacesTabs(line);
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimSpacesTabs(lines[i++]));
-    const html = inline(body.join('\n'), linkFn);
+    while (i < n && !endsParagraph(lines[i])) text += `\n${trimSpacesTabs(lines[i++])}`;
+    const html = inline(text, linkFn);
     if (excerpt === null) excerpt = html;
-    blocks.push(`<p>${html}</p>`);
+    out += `<p>${html}</p>\n`;
   }
-  let html = '';
-  for (const b of blocks) html += `${b}\n`;
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: out, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -808,12 +835,16 @@ function renderNodes(nodes, scope, templates, depth, sink) {
       case 0:
         sink.s += nd.text;
         break;
-      case 1:
-        sink.s += escapeHtml(textOf(lookupPath(scope, nd.path)));
+      case 1: {
+        const v = lookupPath(scope, nd.path);
+        sink.s += typeof v === 'string' ? escapeHtml(v) : escapeHtml(textOf(v));
         break;
-      case 2:
-        sink.s += textOf(lookupPath(scope, nd.path));
+      }
+      case 2: {
+        const v = lookupPath(scope, nd.path);
+        sink.s += typeof v === 'string' ? v : textOf(v);
         break;
+      }
       case 4: {
         const branch = truthy(lookupPath(scope, nd.path)) !== nd.not ? nd.then : nd.els;
         if (branch !== null) renderNodes(branch, scope, templates, depth, sink);
@@ -918,18 +949,32 @@ function cardOf(s, longDateC) {
 
 /** A page as its layout reads it: its (cached) card, plus the page-only fields. */
 function pageOf(s, longDateC) {
-  const page = { ...s.card };
-  page.slug = s.slug;
-  page.content = s.html;
-  page.toc = s.toc;
-  page.newer = linkOf(s.newer ?? null, longDateC);
-  page.older = linkOf(s.older ?? null, longDateC);
-  page.is_post = s.post;
-  return page;
+  // Built in one literal rather than spread from the card and patched: one allocation with a stable shape,
+  // and the card's tags array is shared (templates only ever read it).
+  const c = s.card;
+  return {
+    title: c.title,
+    url: c.url,
+    date: c.date,
+    date_long: c.date_long,
+    summary: c.summary,
+    excerpt: c.excerpt,
+    reading_minutes: c.reading_minutes,
+    tags: c.tags,
+    slug: s.slug,
+    content: s.html,
+    toc: s.toc,
+    newer: linkOf(s.newer ?? null, longDateC),
+    older: linkOf(s.older ?? null, longDateC),
+    is_post: s.post,
+  };
 }
 
 /** makefun-site 1.0.0's answer for one case's input: its output tree, path -> text. */
 export function run(input) {
+  // Each case is answered alone: the slug expansion memo starts empty for every case (it only ever holds
+  // pure per-character Unicode data, but nothing is carried from one case to the next).
+  slugExpansion.clear();
   // Templates, parsed in code-unit order of name; one that does not parse is reported and left out.
   const templates = new Map();
   const report = [];
